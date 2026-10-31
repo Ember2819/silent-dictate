@@ -11,8 +11,17 @@ android {
         applicationId = "app.silentdictate"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
+    }
+
+    signingConfigs {
+        // Samsung's sideload installer can be picky about v2-only signatures
+        // and uncompressed native libs; sign old-school too and extract libs.
+        getByName("debug") {
+            enableV1Signing = true
+            enableV2Signing = true
+        }
     }
 
     buildTypes {
@@ -38,6 +47,9 @@ android {
     }
     packaging {
         resources.excludes += "META-INF/*.kotlin_module"
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 

@@ -41,6 +41,9 @@ Requires JDK 17. Output: `app/build/outputs/apk/debug/` — you get per-ABI APKs
 (`app-arm64-v8a-debug.apk` for most phones, `app-x86_64-debug.apk` for
 emulators) and a big `app-universal-debug.apk`.
 
+Then run `./tools/resign.sh` — Samsung's sideload installer rejects
+v2-only builds; this re-signs everything with v1+v2 signatures.
+
 ## First run (onboarding)
 
 1. Install the app, open **Silent Dictate**.
