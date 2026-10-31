@@ -37,7 +37,9 @@ tools/export_lip_model.py          export a VSR checkpoint for the app
 ./gradlew assembleDebug     # or open in Android Studio
 ```
 
-Requires JDK 17. Output: `app/build/outputs/apk/debug/`.
+Requires JDK 17. Output: `app/build/outputs/apk/debug/` — you get per-ABI APKs
+(`app-arm64-v8a-debug.apk` for most phones, `app-x86_64-debug.apk` for
+emulators) and a big `app-universal-debug.apk`.
 
 ## First run (onboarding)
 
