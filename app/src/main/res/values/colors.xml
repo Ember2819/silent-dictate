@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#101113</color>
+    <color name="surface">#17191C</color>
+    <color name="surface_2">#1E2126</color>
+    <color name="hairline">#26282B</color>
+    <color name="text_primary">#ECEDEF</color>
+    <color name="text_secondary">#8A8F98</color>
+    <color name="text_faint">#565B63</color>
+    <color name="danger">#E5726E</color>
+    <color name="ok">#9BC77F</color>
+    <color name="icon_bg">#101113</color>
+</resources>

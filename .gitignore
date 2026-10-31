@@ -1,0 +1,32 @@
+# Gradle / build
+build/
+.gradle/
+local.properties
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Android
+captures/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin/JVM
+*.class
+*.jks
+*.keystore
+
+# Model artifacts (too big for the repo; download via the app or CI)
+*.onnx
+model_zip/
+
+# Misc logs
+*.log
+.DS_Store
