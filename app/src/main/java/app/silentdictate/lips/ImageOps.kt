@@ -13,27 +13,6 @@ import kotlin.math.roundToInt
  * stream, which is what public lip-reading models are trained on.
  */
 
-/** Rectangle as fractions (0..1) of a frame: left, top, right, bottom. */
-data class RectPct(
-    val left: Float,
-    val top: Float,
-    val right: Float,
-    val bottom: Float,
-) {
-    val width: Float get() = right - left
-    val height: Float get() = bottom - top
-    fun inset(fx: Float, fy: Float): RectPct {
-        val cx = (left + right) / 2f
-        val cy = (top + bottom) / 2f
-        return RectPct(
-            (cx - width / 2f * fx).coerceIn(0f, 1f),
-            (cy - height / 2f * fy).coerceIn(0f, 1f),
-            (cx + width / 2f * fx).coerceIn(0f, 1f),
-            (cy + height / 2f * fy).coerceIn(0f, 1f),
-        )
-    }
-}
-
 object ImageOps {
 
     /** Dimensions in upright space for a sensor frame w x h rotated [rotation] degrees. */
@@ -56,40 +35,51 @@ object ImageOps {
         if (v < 0) 0 else if (v >= max) max - 1 else v
 
     /**
-     * Sample a mouth patch (fractions of the upright frame in [rect]) out of the
-     * Y plane, rotated upright and resized to outW x outH, normalized as
-     * (y / 255 - mean) / std. Output layout is c,h,w with a single channel.
+     * Cut the aligned mouth crop (see [FaceAlign]) out of a packed Y plane.
+     *
+     * [pose] maps upright-frame pixels (size [upW] x [upH]) onto the reference
+     * face. Output is [outW] x [outH], bilinear, normalised as
+     * (y / 255 - mean) / std, row-major.
      */
-    fun sampleMouth(
+    fun sampleAligned(
         y: ByteArray,
-        rowStride: Int,
-        pixelStride: Int,
         w: Int,
         h: Int,
         rotation: Int,
-        rect: RectPct,
+        pose: FaceAlign.Pose,
+        upW: Int,
+        upH: Int,
         out: FloatArray,
         outW: Int,
         outH: Int,
         mean: Float,
         std: Float,
     ) {
+        val xy = DoubleArray(2)
         var idx = 0
-        var j = 0
-        while (j < outH) {
-            val vp = (rect.top + ((j + 0.5f) / outH) * rect.height).coerceIn(0f, 1f)
-            var i = 0
-            while (i < outW) {
-                val up = (rect.left + ((i + 0.5f) / outW) * rect.width).coerceIn(0f, 1f)
-                val (su, sv) = uprightToSource(up, vp, rotation)
-                val sx = clampIdx((su * w).roundToInt(), w)
-                val sy = clampIdx((sv * h).roundToInt(), h)
-                val yi = sy * rowStride + sx * pixelStride
-                val yy = if (yi < y.size) (y[yi].toInt() and 0xFF) else 128
-                out[idx++] = ((yy / 255f) - mean) / std
-                i++
+        for (j in 0 until outH) {
+            for (i in 0 until outW) {
+                FaceAlign.cropToImage(pose, i, j, outW, outH, xy)
+                val u = (xy[0] / upW).toFloat().coerceIn(0f, 1f)
+                val v = (xy[1] / upH).toFloat().coerceIn(0f, 1f)
+                val (su, sv) = uprightToSource(u, v, rotation)
+                val fx = (su * w - 0.5f).coerceIn(0f, (w - 1).toFloat())
+                val fy = (sv * h - 0.5f).coerceIn(0f, (h - 1).toFloat())
+                val x0 = fx.toInt()
+                val y0 = fy.toInt()
+                val x1 = if (x0 + 1 < w) x0 + 1 else x0
+                val y1 = if (y0 + 1 < h) y0 + 1 else y0
+                val ax = fx - x0
+                val ay = fy - y0
+                val p00 = y[y0 * w + x0].toInt() and 0xFF
+                val p10 = y[y0 * w + x1].toInt() and 0xFF
+                val p01 = y[y1 * w + x0].toInt() and 0xFF
+                val p11 = y[y1 * w + x1].toInt() and 0xFF
+                val top = p00 + (p10 - p00) * ax
+                val bot = p01 + (p11 - p01) * ax
+                val yy = top + (bot - top) * ay
+                out[idx++] = (yy / 255f - mean) / std
             }
-            j++
         }
     }
 
@@ -107,7 +97,8 @@ object ImageOps {
     ): Nv21Frame {
         val (upWf, upHf) = uprightSize(w, h, rotation)
         val outW = targetW
-        val outH = (targetW * upHf.toFloat() / upWf).toInt().coerceAtLeast(64)
+        // NV21 needs even dimensions (chroma is subsampled 2x2)
+        val outH = ((targetW * upHf.toFloat() / upWf).toInt().coerceAtLeast(64)) and 1.inv()
         val outY = ByteArray(outW * outH)
         val outC = ByteArray((outW / 2) * (outH / 2) * 2) // pairs: V,U per 2x2 block
 

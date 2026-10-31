@@ -11,8 +11,10 @@ android {
         applicationId = "app.silentdictate"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.1.1"
+        // CI passes these from the git tag (v1.2.3) and run number; local builds use the defaults
+        versionCode = (System.getenv("VERSION_CODE") ?: "3").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.2.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -22,11 +24,24 @@ android {
             enableV1Signing = true
             enableV2Signing = true
         }
+        // Release key comes from the environment (GitHub Actions secrets), never the repo.
+        val releaseStore = System.getenv("RELEASE_KEYSTORE_PATH")
+        if (releaseStore != null) {
+            create("release") {
+                storeFile = file(releaseStore)
+                storePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS")
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -67,4 +82,7 @@ dependencies {
     implementation("com.google.mlkit:face-detection:16.1.6")
 
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
+
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test:runner:1.5.2")
 }

@@ -5,37 +5,97 @@ import androidx.camera.core.ImageProxy
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetector
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.google.mlkit.vision.face.FaceLandmark
-import kotlin.math.abs
+
+/** Builds the face detector the lip pipeline uses. */
+fun createLipFaceDetector(): FaceDetector = FaceDetection.getClient(
+    FaceDetectorOptions.Builder()
+        .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+        .setMinFaceSize(0.15f)
+        .build()
+)
+
+/**
+ * Turns face detections into a smoothed [FaceAlign.Pose]. Shared by the live
+ * camera path and the real-video test so both run exactly the same maths.
+ */
+class FaceAligner {
+    @Volatile
+    var pose: FaceAlign.Pose? = null
+        private set
+
+    private var missed = 0
+
+    /**
+     * [face] was detected on a thumbnail of [thumbW] x [thumbH]; the full upright
+     * frame is [upW] x [upH]. Returns false when the face had no usable landmarks.
+     */
+    fun onFace(face: Face, thumbW: Int, thumbH: Int, upW: Int, upH: Int): Boolean {
+        val le = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
+        val re = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+        val nose = face.getLandmark(FaceLandmark.NOSE_BASE)?.position
+        val ml = face.getLandmark(FaceLandmark.MOUTH_LEFT)?.position
+        val mr = face.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position
+        if (le == null || re == null || nose == null || ml == null || mr == null) return false
+
+        // landmarks are in thumbnail pixels; the crop is cut from the full frame
+        val kx = upW.toFloat() / thumbW
+        val ky = upH.toFloat() / thumbH
+        val pts = floatArrayOf(
+            re.x * kx, re.y * ky,
+            le.x * kx, le.y * ky,
+            nose.x * kx, nose.y * ky,
+            (ml.x + mr.x) / 2f * kx, (ml.y + mr.y) / 2f * ky,
+        )
+        val fresh = FaceAlign.estimate(pts) ?: return false
+        missed = 0
+        val old = pose
+        pose = if (old == null) fresh else old.blendTo(fresh, SMOOTH)
+        return true
+    }
+
+    /** No face this time. Returns true once it has been gone long enough to drop the pose. */
+    fun onNoFace(): Boolean {
+        if (++missed >= MAX_MISSED) {
+            pose = null
+            return true
+        }
+        return false
+    }
+
+    fun reset() {
+        pose = null
+        missed = 0
+    }
+
+    companion object {
+        private const val SMOOTH = 0.5
+        private const val MAX_MISSED = 3
+    }
+}
 
 /**
  * Camera image pipeline.
  *
- * - starts with the raw sensor frame (YUV),
  * - every [DETECT_EVERY] frames runs ML Kit face detection on a small upright
- *   NV21 thumbnail and tracks a mouth rectangle (fractions of the upright frame),
- * - every frame where a rectangle is known, samples + normalizes the mouth crop
- *   and hands it to [onFrame].
+ *   NV21 thumbnail and updates the face pose,
+ * - every frame where a pose is known, cuts + normalises the aligned mouth crop
+ *   and hands it to [onFrame] together with the camera timestamp (nanoseconds).
  */
 class MouthAnalyzer(
     private val outW: Int,
     private val outH: Int,
     private val mean: Float,
     private val std: Float,
-    private val onFrame: (FloatArray) -> Unit,
+    private val onFrame: (frame: FloatArray, timestampNs: Long) -> Unit,
     private val onFacePresence: (Boolean) -> Unit,
 ) : ImageAnalysis.Analyzer {
 
-    private val detector = FaceDetection.getClient(
-        FaceDetectorOptions.Builder()
-            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
-            .setMinFaceSize(0.15f)
-            .build()
-    )
-
-    @Volatile
-    private var mouthRect: RectPct? = null
+    private val detector = createLipFaceDetector()
+    private val aligner = FaceAligner()
 
     @Volatile
     private var detectedAtLeastOnce = false
@@ -53,18 +113,17 @@ class MouthAnalyzer(
             val rotation = proxy.imageInfo.rotationDegrees
 
             val yPlane = proxy.planes[0]
+            // packed copy: rows are exactly w bytes from here on
             val yBytes = ImageOps.copyPlane(
                 yPlane.buffer, w, h, yPlane.rowStride, yPlane.pixelStride, yBuf
             ).also { yBuf = it }
 
-            val rect = mouthRect
-            if (rect != null) {
-                val frameData = FloatArray(outW * outH)
-                ImageOps.sampleMouth(
-                    yBytes, yPlane.rowStride, yPlane.pixelStride,
-                    w, h, rotation, rect, frameData, outW, outH, mean, std
-                )
-                onFrame(frameData)
+            val pose = aligner.pose
+            if (pose != null) {
+                val (upW, upH) = ImageOps.uprightSize(w, h, rotation)
+                val frame = FloatArray(outW * outH)
+                ImageOps.sampleAligned(yBytes, w, h, rotation, pose, upW, upH, frame, outW, outH, mean, std)
+                onFrame(frame, proxy.imageInfo.timestamp)
             }
 
             if (framesSinceDetect-- <= 0) {
@@ -87,64 +146,33 @@ class MouthAnalyzer(
                 vP.buffer, w / 2, h / 2, vP.rowStride, vP.pixelStride, vBuf
             ).also { vBuf = it }
 
-            // yBytes/uBytes/vBytes are packed width-major, so their strides are
-            // the source dimensions and 1 sample stride.
-            val frame = ImageOps.detectNv21(
+            // all three are packed copies now: stride = row length, sample stride 1
+            val thumb = ImageOps.detectNv21(
                 yBytes, w, 1,
                 uBytes, w / 2, 1,
                 vBytes, w / 2, 1,
-                w, h, rotation, targetW
+                w, h, rotation, DETECT_WIDTH
             )
+            val (upW, upH) = ImageOps.uprightSize(w, h, rotation)
             val image = InputImage.fromByteArray(
-                frame.bytes, frame.width, frame.height, 0, InputImage.IMAGE_FORMAT_NV21
+                thumb.bytes, thumb.width, thumb.height, 0, InputImage.IMAGE_FORMAT_NV21
             )
             detector.process(image)
                 .addOnSuccessListener { faces ->
-                    if (faces.isEmpty()) {
-                        if (detectedAtLeastOnce) onFacePresence(false)
-                        return@addOnSuccessListener
+                    val face = faces.maxByOrNull {
+                        it.boundingBox.width().toLong() * it.boundingBox.height().toLong()
                     }
-                    detectedAtLeastOnce = true
-                    onFacePresence(true)
-                    val face = faces.maxBy {
-                        val bb = it.boundingBox
-                        bb.width().toLong() * bb.height().toLong()
+                    if (face != null && aligner.onFace(face, thumb.width, thumb.height, upW, upH)) {
+                        detectedAtLeastOnce = true
+                        onFacePresence(true)
+                    } else if (aligner.onNoFace()) {
+                        onFacePresence(false)
                     }
-                    mouthRect = computeMouth(face, frame.width, frame.height)
                 }
                 .addOnFailureListener { onFacePresence(false) }
         } catch (t: Throwable) {
             onFacePresence(false)
         }
-    }
-
-    /** Mouth patch as fractions of the (upright) detection frame; null if unusable. */
-    private fun computeMouth(face: Face, fw: Int, fh: Int): RectPct? {
-        val box = face.boundingBox ?: return null
-        val fx = { x: Float -> (x / fw.toFloat()).coerceIn(0f, 1f) }
-        val fy = { y: Float -> (y / fh.toFloat()).coerceIn(0f, 1f) }
-
-        val left = face.getLandmark(FaceLandmark.MOUTH_LEFT)
-        val right = face.getLandmark(FaceLandmark.MOUTH_RIGHT)
-        val bottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM)
-
-        if (left != null && right != null && bottom != null) {
-            val lx = left.position.x
-            val rx = right.position.x
-            val cornerAvgY = (left.position.y + right.position.y) / 2f
-            val by = bottom.position.y
-            val cx = (lx + rx) / 2f
-            val cy = (cornerAvgY + by) / 2f
-            val halfW = (abs(rx - lx) * 0.62f).coerceAtLeast(6f)
-            val halfH = (abs(by - cornerAvgY) * 1.45f).coerceAtLeast(6f)
-            return RectPct(fx(cx - halfW), fy(cy - halfH), fx(cx + halfW), fy(cy + halfH))
-        }
-        // bbox fallback: middle-lower band of the face box
-        val cx = (box.left + box.right) / 2f
-        val top = box.top + box.height() * 0.60f
-        val bot = box.top + box.height() * 0.92f
-        val halfW = box.width() * 0.26f
-        return RectPct(fx(cx - halfW), fy(top), fx(cx + halfW), fy(bot))
     }
 
     fun isFaceTracked(): Boolean = detectedAtLeastOnce
@@ -154,7 +182,7 @@ class MouthAnalyzer(
     }
 
     companion object {
-        private const val DETECT_EVERY = 4
-        private const val targetW = 208
+        private const val DETECT_EVERY = 3
+        const val DETECT_WIDTH = 320
     }
 }

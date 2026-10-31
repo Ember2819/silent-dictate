@@ -1,14 +1,15 @@
 package app.silentdictate.ime
 
-import android.annotation.SuppressLint
+import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
-import android.os.Handler
-import android.os.Looper
-import android.util.TypedValue
+import android.os.SystemClock
+import android.text.InputType
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowInsets
+import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import app.silentdictate.Prefs
 import app.silentdictate.lips.DictationController
@@ -16,104 +17,141 @@ import app.silentdictate.util.Palette
 import kotlin.math.min
 
 /**
- * The input method. Hosts two stacked views:
+ * The input method. Two pages in one frame:
  *   - [KeyboardView]: regular typing; swipe left → dictation
  *   - [MicPanel]: hold to read lips; swipe right → typing
  */
 class SilentDictateImeService : InputMethodService() {
 
-    private val main = Handler(Looper.getMainLooper())
+    private enum class Mode { Letters, Mic }
 
-    private var prefs: Prefs? = null
+    private lateinit var prefs: Prefs
     private var controller: DictationController? = null
 
-    private val root = FrameLayout(this)
-    private val keyboardView = KeyboardView(this)
-    private val micPanel = MicPanel(this)
-
+    private var root: FrameLayout? = null
+    private var keyboardView: KeyboardView? = null
+    private var micPanel: MicPanel? = null
     private var mode = Mode.Letters
 
-    private enum class Mode { Letters, Mic }
+    /** The field a dictation was started in; results only ever go back there. */
+    private var dictationTarget: String? = null
+    private var lastSpaceAt = 0L
 
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
-        val p = prefs!!
-        val textCtx = {
-            try {
-                currentInputConnection?.getTextBeforeCursor(240, 0)?.toString() ?: ""
-            } catch (t: Throwable) {
-                ""
-            }
-        }
         controller = DictationController(
-            this, p, textCtx,
+            this, prefs, ::textBeforeCursorForCleanup,
             object : DictationController.Listener {
-                override fun onDictationState(state: DictationController.State, message: String?) {
-                    main.post {
-                        micPanel.setState(
-                            when (state) {
-                                DictationController.State.IDLE -> MicPanel.State.IDLE
-                                DictationController.State.HOLDING -> MicPanel.State.HOLDING
-                                DictationController.State.THINKING -> MicPanel.State.THINKING
-                            },
-                            message
-                        )
-                    }
+                override fun onDictationState(
+                    state: DictationController.State, message: String?, isError: Boolean,
+                ) {
+                    micPanel?.setState(
+                        when (state) {
+                            DictationController.State.IDLE -> MicPanel.State.IDLE
+                            DictationController.State.HOLDING -> MicPanel.State.HOLDING
+                            DictationController.State.THINKING -> MicPanel.State.THINKING
+                        },
+                        message, isError
+                    )
                 }
 
-                override fun onDictationResult(text: String) {
-                    main.post {
-                        val ic = currentInputConnection ?: return@post
-                        ic.commitText(text, 1)
-                        storeRecent(text)
-                        p.swipeHintDone = true
-                    }
+                override fun onDictationResult(text: String) = commitDictation(text)
+
+                override fun onFacePresence(visible: Boolean) {
+                    micPanel?.setFaceVisible(visible)
                 }
             }
         )
-        controller?.onCreate()
+    }
 
-        keyboardView.setListener(object : KeyboardView.Listener {
+    override fun onDestroy() {
+        controller?.onDestroy()
+        controller = null
+        super.onDestroy()
+    }
+
+    // The extract UI would cover the whole screen in landscape; keep the keys compact.
+    override fun onEvaluateFullscreenMode(): Boolean = false
+
+    // ------------------------------------------------------------------ view
+
+    override fun onCreateInputView(): View {
+        val keys = KeyboardView(this)
+        val mic = MicPanel(this)
+        keyboardView = keys
+        micPanel = mic
+        wireKeyboard(keys)
+        wireMic(mic)
+
+        // The IME window wraps its content, so MATCH_PARENT pages would take the
+        // whole screen: give the pages an explicit height instead.
+        val dm = resources.displayMetrics
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val wanted = (if (landscape) 200f else 252f) * dm.density
+        val heightPx = min(wanted, dm.heightPixels * 0.55f).toInt()
+
+        val frame = FrameLayout(this).apply {
+            setBackgroundColor(Palette.bg)
+            addView(keys, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, heightPx))
+            addView(mic, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, heightPx))
+        }
+        root = frame
+
+        // paint the system navigation area in the keyboard's colour
+        window?.window?.navigationBarColor = Palette.bg
+
+        showMode(Mode.Letters, animate = false)
+        keys.showSwipeHint(!prefs.swipeHintDone)
+        return frame
+    }
+
+    private fun wireKeyboard(keys: KeyboardView) {
+        keys.setListener(object : KeyboardView.Listener {
             override fun onCommit(text: String) {
-                val ic = currentInputConnection
-                ic?.commitText(text, 1)
-                storeRecent(text)
-                val p = prefs ?: return
-                if (!p.swipeHintDone) {
-                    p.swipeHintDone = true
-                    keyboardView.swipeHintDone()
+                if (text == " " && doubleSpacePeriod()) return
+                lastSpaceAt = if (text == " ") SystemClock.uptimeMillis() else 0L
+                currentInputConnection?.commitText(text, 1)
+                if (!prefs.swipeHintDone) {
+                    prefs.swipeHintDone = true
+                    keys.swipeHintDone()
                 }
             }
 
             override fun onBackspace() {
-                val ic = currentInputConnection
-                ic?.deleteSurroundingText(1, 0)
+                sendKey(KeyEvent.KEYCODE_DEL)
             }
 
             override fun onEnter() {
+                val ic = currentInputConnection ?: return
                 val info = currentInputEditorInfo
-                val ic = currentInputConnection
-                if (ic == null) return
-                val action = info?.actionId ?: 0
-                if (action != 0 && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
-                    ic.performEditorAction(action)
+                if (enterPerformsAction(info)) {
+                    ic.performEditorAction(info!!.imeOptions and EditorInfo.IME_MASK_ACTION)
                 } else {
-                    ic.commitText("\n", 1)
+                    sendKey(KeyEvent.KEYCODE_ENTER)
                 }
             }
 
             override fun onSwipeLeft() {
-                switchMode()
+                prefs.swipeHintDone = true
+                keys.swipeHintDone()
+                showMode(Mode.Mic, animate = true)
+            }
+
+            override fun onSpaceLongPress() {
+                (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
             }
 
             override fun needCapsRefresh() {
                 refreshCaps()
             }
         })
+    }
 
-        micPanel.setListener(object : MicPanel.Listener {
+    private fun wireMic(mic: MicPanel) {
+        mic.setListener(object : MicPanel.Listener {
             override fun onHoldStart() {
+                dictationTarget = editorKey()
                 controller?.beginHold()
             }
 
@@ -126,141 +164,180 @@ class SilentDictateImeService : InputMethodService() {
             }
 
             override fun onBack() {
-                switchMode()
+                showMode(Mode.Letters, animate = true)
             }
         })
     }
 
-    private fun storeRecent(text: String) {
-        val p = prefs ?: return
-        p.recentText = ((p.recentText + " " + text).trim().takeLast(240))
-    }
-
-    override fun onDestroy() {
-        controller?.onDestroy()
-        controller = null
-        super.onDestroy()
-    }
-
-    @SuppressLint("InflateParams")
-    override fun onCreateInputView(): View {
-        root.removeAllViews()
-        root.setBackgroundColor(Palette.bg)
-        root.addView(
-            keyboardView,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        )
-        root.addView(
-            micPanel,
-            FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ).also { it.topMargin = 0 }
-        )
-        micPanel.visibility = View.INVISIBLE
-        mode = Mode.Letters
-        keyboardView.showSwipeHint(!(prefs?.swipeHintDone ?: true))
-
-        root.setOnApplyWindowInsetsListener { v, insets ->
-            val bottom = if (android.os.Build.VERSION.SDK_INT >= 30) {
-                insets.getInsets(WindowInsets.Type.navigationBars()).bottom
-            } else {
-                insets.systemWindowInsetBottom
-            }
-            v.setPadding(0, 0, 0, bottom)
-            insets
-        }
-
-        val heightPx = min(
-            (resources.displayMetrics.heightPixels * 0.44f).toInt(),
-            TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, 380f, resources.displayMetrics
-            ).toInt()
-        ).coerceAtLeast(
-            TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, 260f, resources.displayMetrics
-            ).toInt()
-        )
-        root.layoutParams = FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, heightPx
-        )
-        return root
-    }
+    // ------------------------------------------------------------------ editor
 
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        controller?.onInputShown()
+        val keys = keyboardView ?: return
+        val cls = info.inputType and InputType.TYPE_MASK_CLASS
+        keys.setSymbols(
+            cls == InputType.TYPE_CLASS_NUMBER || cls == InputType.TYPE_CLASS_PHONE ||
+                cls == InputType.TYPE_CLASS_DATETIME
+        )
+        keys.resetShift()
+        // icon and behaviour come from the same rule, so ↵ never sends a message
+        keys.setEnterIsAction(enterPerformsAction(info))
+        // nothing a person mouths should ever land in a password field
+        val dictation = !isPasswordField(info)
+        keys.setDictationEnabled(dictation)
+        if (!dictation && mode == Mode.Mic) showMode(Mode.Letters, animate = false)
         refreshCaps()
-        if (mode != Mode.Letters) switchModeAnimated(Mode.Letters)
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
-        controller?.onInputHidden()
+        // the camera only runs while the dictation page is visible
+        controller?.deactivate()
+        if (mode == Mode.Mic) showMode(Mode.Letters, animate = false)
         super.onFinishInputView(finishingInput)
     }
 
     override fun onUpdateSelection(
-        oldSelStart: Int,
-        oldSelEnd: Int,
-        newSelStart: Int,
-        newSelEnd: Int,
-        candidatesStart: Int,
-        candidatesEnd: Int,
+        oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int,
     ) {
-        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        super.onUpdateSelection(
+            oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd
+        )
         refreshCaps()
     }
 
     private fun refreshCaps() {
-        keyboardView.refreshCaps(currentInputConnection, currentInputEditorInfo)
+        keyboardView?.refreshCaps(currentInputConnection, currentInputEditorInfo)
     }
 
-    private fun switchMode() {
-        switchModeAnimated(if (mode == Mode.Letters) Mode.Mic else Mode.Letters)
+    private fun enterPerformsAction(info: EditorInfo?): Boolean {
+        val opts = info?.imeOptions ?: return false
+        val action = opts and EditorInfo.IME_MASK_ACTION
+        return opts and EditorInfo.IME_FLAG_NO_ENTER_ACTION == 0 &&
+            action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED
     }
 
-    private fun switchModeAnimated(target: Mode) {
-        if (mode == target) return
-        mode = target
-        // Static cross-fade with a slight slide; keep it calm and minimal.
-        keyboardView.animate().cancel()
-        micPanel.animate().cancel()
-        if (target == Mode.Mic) {
-            micPanel.visibility = View.VISIBLE
-            micPanel.alpha = 0f
-            micPanel.translationX = -root.width * 0.12f
-            keyboardView.animate()
-                .alpha(0f)
-                .translationX(root.width * 0.12f)
-                .setDuration(170L)
-                .start()
-            micPanel.animate()
-                .alpha(1f)
-                .translationX(0f)
-                .setDuration(170L)
-                .withEndAction { keyboardView.visibility = View.INVISIBLE }
-                .start()
-            // clear any leftover dictation state
-            micPanel.setState(MicPanel.State.IDLE, null)
-        } else {
-            keyboardView.visibility = View.VISIBLE
-            keyboardView.alpha = 0f
-            keyboardView.translationX = -root.width * 0.12f
-            micPanel.animate()
-                .alpha(0f)
-                .translationX(root.width * 0.12f)
-                .setDuration(170L)
-                .start()
-            keyboardView.animate()
-                .alpha(1f)
-                .translationX(0f)
-                .setDuration(170L)
-                .withEndAction { micPanel.visibility = View.INVISIBLE }
-                .start()
-            keyboardView.showSwipeHint(!(prefs?.swipeHintDone ?: true))
+    /** Identifies the focused field (app + view id + type). */
+    private fun editorKey(): String? {
+        val info = currentInputEditorInfo ?: return null
+        return "${info.packageName}/${info.fieldId}/${info.inputType}"
+    }
+
+    /** "word␣" + space within a second → "word.␣", as on most keyboards. Plain-text fields only. */
+    private fun doubleSpacePeriod(): Boolean {
+        val info = currentInputEditorInfo ?: return false
+        if (SystemClock.uptimeMillis() - lastSpaceAt > 1000L) return false
+        if (info.inputType and InputType.TYPE_MASK_CLASS != InputType.TYPE_CLASS_TEXT) return false
+        val variation = info.inputType and InputType.TYPE_MASK_VARIATION
+        if (variation == InputType.TYPE_TEXT_VARIATION_URI ||
+            variation == InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+            variation == InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS ||
+            isPasswordField(info)
+        ) return false
+        val ic = currentInputConnection ?: return false
+        val before = ic.getTextBeforeCursor(2, 0) ?: return false
+        if (before.length < 2 || before[1] != ' ' || !before[0].isLetterOrDigit()) return false
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(1, 0)
+        ic.commitText(". ", 1)
+        ic.endBatchEdit()
+        lastSpaceAt = 0L
+        return true
+    }
+
+    private fun sendKey(code: Int) {
+        // timestamps + soft-keyboard flags; hand-built KeyEvents get dropped by some editors
+        sendDownUpKeyEvents(code)
+    }
+
+    private fun isPasswordField(info: EditorInfo?): Boolean {
+        val t = info?.inputType ?: return false
+        val cls = t and InputType.TYPE_MASK_CLASS
+        val variation = t and InputType.TYPE_MASK_VARIATION
+        return when (cls) {
+            InputType.TYPE_CLASS_TEXT ->
+                variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD ||
+                    variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            else -> false
         }
+    }
+
+    /** Context for the cleanup pass; never read out of a password field. */
+    private fun textBeforeCursorForCleanup(): String {
+        if (isPasswordField(currentInputEditorInfo)) return ""
+        return try {
+            currentInputConnection?.getTextBeforeCursor(240, 0)?.toString().orEmpty()
+        } catch (t: Throwable) {
+            ""
+        }
+    }
+
+    private fun commitDictation(text: String) {
+        // a slow cleanup can finish after the user moved on; never type into another field
+        // (or another app, or a password box) than the one they dictated for
+        val target = dictationTarget
+        dictationTarget = null
+        if (target == null || target != editorKey() || !isInputViewShown ||
+            isPasswordField(currentInputEditorInfo)
+        ) {
+            micPanel?.setState(MicPanel.State.IDLE, "The text field changed — nothing was inserted", true)
+            return
+        }
+        val ic = currentInputConnection ?: return
+        val before = ic.getTextBeforeCursor(1, 0)
+        val lead = if (!before.isNullOrEmpty() && !before.last().isWhitespace()) " " else ""
+        ic.commitText(lead + text, 1)
+        prefs.swipeHintDone = true
+    }
+
+    // ------------------------------------------------------------------ pages
+
+    private fun showMode(target: Mode, animate: Boolean) {
+        val keys = keyboardView ?: return
+        val mic = micPanel ?: return
+        val width = (root?.width ?: 0).takeIf { it > 0 } ?: resources.displayMetrics.widthPixels
+        val shift = width * 0.16f
+        val changed = mode != target
+        mode = target
+
+        if (target == Mode.Mic) {
+            mic.setState(MicPanel.State.IDLE, null)
+            controller?.activate() // may report a missing model / permission into the panel
+        } else {
+            controller?.deactivate()
+        }
+
+        val incoming = if (target == Mode.Mic) mic else keys
+        val outgoing = if (target == Mode.Mic) keys else mic
+        // incoming enters from the side the user is swiping toward
+        val enterFrom = if (target == Mode.Mic) shift else -shift
+
+        incoming.animate().cancel()
+        outgoing.animate().cancel()
+
+        if (!animate || !changed) {
+            incoming.visibility = View.VISIBLE
+            incoming.alpha = 1f
+            incoming.translationX = 0f
+            outgoing.visibility = View.INVISIBLE
+            outgoing.alpha = 0f
+            outgoing.translationX = 0f
+            return
+        }
+
+        incoming.visibility = View.VISIBLE
+        incoming.alpha = 0f
+        incoming.translationX = enterFrom
+        incoming.animate()
+            .alpha(1f).translationX(0f)
+            .setDuration(220L).setInterpolator(DecelerateInterpolator(1.6f))
+            .start()
+        outgoing.animate()
+            .alpha(0f).translationX(-enterFrom)
+            .setDuration(160L).setInterpolator(DecelerateInterpolator())
+            .withEndAction { if (mode == target) outgoing.visibility = View.INVISIBLE }
+            .start()
     }
 }

@@ -1,5 +1,6 @@
 package app.silentdictate.ai
 
+import app.silentdictate.Prefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,7 +19,7 @@ class OpenRouterClient {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS) // free models can be slow
         .build()
 
     sealed class Result {
@@ -37,9 +38,9 @@ class OpenRouterClient {
         )
 
         val body = JSONObject().apply {
-            put("model", model.ifBlank { "meta-llama/llama-3.2-3b-instruct:free" })
+            put("model", model.ifBlank { Prefs.DEFAULT_OPENROUTER_MODEL })
             put("temperature", 0.2)
-            put("max_tokens", 200)
+            put("max_tokens", 2000) // a minute of dictation plus room for reasoning models behind openrouter/free
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put(
                     "content",
@@ -48,7 +49,8 @@ class OpenRouterClient {
                         "silent speech from mouth movements: it is noisy, may contain phonetic " +
                         "fragments, missing words or repeated syllables. " +
                         "Respond with ONLY the most likely intended message, as plain text, " +
-                        "punctuation included, no quotes, no commentary, no explanations. " +
+                        "with natural capitalisation and punctuation, no quotes, no commentary, " +
+                        "no explanations. Stay close to what was read; do not invent extra content. " +
                         "If you truly cannot infer anything, respond with an empty string."
                 ))
                 put(JSONObject().put("role", "user").put(
@@ -60,7 +62,7 @@ class OpenRouterClient {
                             append("\"\n\n")
                         }
                         append("Raw lip-reading transcript to reconstruct:\n\"")
-                        append(rawLipRead.take(600))
+                        append(rawLipRead.take(MAX_RAW_CHARS))
                         append('"')
                     }
                 ))
@@ -79,27 +81,54 @@ class OpenRouterClient {
             http.newCall(req).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    val msg = when (resp.code) {
-                        401, 403 -> "OpenRouter rejected the API key"
-                        402 -> "OpenRouter: model needs credits, pick a free one"
-                        else -> "OpenRouter error ${resp.code}"
-                    }
-                    return@withContext Result.Error(msg)
+                    return@withContext Result.Error(errorMessage(resp.code, text))
                 }
-                val content = JSONObject(text)
+                val message = JSONObject(text)
                     .optJSONArray("choices")
                     ?.optJSONObject(0)
                     ?.optJSONObject("message")
-                    ?.optString("content")
-                    .orEmpty()
-                if (content.isBlank()) {
-                    Result.Error("Cleanup returned nothing")
-                } else {
-                    Result.Ok(content.trim().trim('"', '’', '“', '”', '.', ' '))
-                }
+                // JSON null must not become the literal string "null"
+                val content = if (message == null || message.isNull("content")) ""
+                else message.optString("content")
+                val cleaned = tidy(content)
+                if (cleaned.isBlank()) Result.Error("Cleanup returned nothing")
+                else Result.Ok(cleaned)
             }
         } catch (e: Exception) {
             Result.Error("Network error: ${e.message ?: "no connection"}")
         }
+    }
+
+    private fun errorMessage(code: Int, body: String): String = when (code) {
+        401, 403 -> "OpenRouter rejected the API key"
+        402 -> "OpenRouter: this model needs credits — try openrouter/free"
+        404 -> "OpenRouter couldn’t find that model"
+        429 -> "OpenRouter is rate-limiting — try again in a moment"
+        else -> {
+            val detail = try {
+                JSONObject(body).optJSONObject("error")?.optString("message").orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+            if (detail.isNotBlank()) "OpenRouter: ${detail.take(90)}" else "OpenRouter error $code"
+        }
+    }
+
+    /** Trim, and drop a single pair of wrapping quotes; keep the sentence's own punctuation. */
+    private fun tidy(raw: String): String {
+        var t = raw.trim()
+        val pairs = listOf('"' to '"', '“' to '”', '\'' to '\'')
+        for ((open, close) in pairs) {
+            if (t.length >= 2 && t.first() == open && t.last() == close) {
+                t = t.substring(1, t.length - 1).trim()
+                break
+            }
+        }
+        return t
+    }
+
+    companion object {
+        /** ~60 s of dictation is well under this; it only guards against runaway input. */
+        private const val MAX_RAW_CHARS = 4000
     }
 }

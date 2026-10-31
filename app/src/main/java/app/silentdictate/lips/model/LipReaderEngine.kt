@@ -40,22 +40,62 @@ class LipReaderEngine(private val context: Context) {
         data class No(val message: String) : Ready()
     }
 
+    @Volatile
     private var session: OrtSession? = null
+    @Volatile
     private var spec: Spec? = null
 
-    /** Scans the model dir and builds a session if possible. Call from IO. */
+    /** Loads the installed model, replacing any previous session. Call from IO. */
     fun prepare(): Ready {
-        try {
-            session?.close()
-            session = null
-            spec = null
+        close()
+        spec = null
+        val result = load(File(context.filesDir, "model"))
+        if (result is Loaded.Ok) {
+            session = result.session
+            spec = result.spec
+            vocab = result.vocab
+            return Ready.Yes(result.spec)
+        }
+        return Ready.No((result as Loaded.Fail).message)
+    }
 
-            val dir = File(context.filesDir, "model")
+    /**
+     * Verifies a model directory without touching the live session: it must
+     * load, and one dummy clip must run through it. Call from IO.
+     */
+    fun prepareFrom(dir: File): Ready {
+        val result = load(dir)
+        if (result is Loaded.Fail) return Ready.No(result.message)
+        result as Loaded.Ok
+        return try {
+            val sp = result.spec
+            val t = if (sp.fixedT > 0) sp.fixedT else 8
+            val blank = List(t) { FloatArray(sp.width * sp.height) }
+            vocab = result.vocab
+            infer(result.session, sp, blank)
+            Ready.Yes(sp)
+        } catch (e: Exception) {
+            Ready.No("Model loads but doesn’t run: ${e.message ?: e.javaClass.simpleName}")
+        } finally {
+            try {
+                result.session.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private sealed class Loaded {
+        class Ok(val session: OrtSession, val spec: Spec, val vocab: List<String>) : Loaded()
+        class Fail(val message: String) : Loaded()
+    }
+
+    private fun load(dir: File): Loaded {
+        try {
             val onnx = File(dir, "model.onnx")
             val configFile = File(dir, "config.json")
             val vocabFile = File(dir, "vocab.txt")
             if (!onnx.exists() || !configFile.exists() || !vocabFile.exists()) {
-                return Ready.No("Lip model not installed")
+                return Loaded.Fail("Lip model not installed")
             }
 
             val config = org.json.JSONObject(configFile.readText())
@@ -65,14 +105,14 @@ class LipReaderEngine(private val context: Context) {
             }
             val order = config.optString("input_order", "ntchw")
             if (order.length != shape.size || order.any { it !in "ncthw" }) {
-                return Ready.No("config.json input_order invalid")
+                return Loaded.Fail("config.json: input_order doesn’t match input_shape")
             }
             fun dimOf(letter: Char): Int = shape[order.indexOf(letter)]
             val t = dimOf('t')
             val channels = dimOf('c')
             val h = dimOf('h')
             val w = dimOf('w')
-            if (channels != 1 && channels != 3) return Ready.No("channels must be 1 or 3")
+            if (channels != 1 && channels != 3) return Loaded.Fail("config.json: model must take 1 or 3 channels")
 
             val spec = Spec(
                 inputName = config.optString("input_name", "input"),
@@ -92,12 +132,14 @@ class LipReaderEngine(private val context: Context) {
             )
 
             val env = OrtEnvironment.getEnvironment()
-            val bytes = onnx.readBytes()
-            session = env.createSession(bytes)
-            this.spec = spec
-            return Ready.Yes(spec)
+            val newSession = OrtSession.SessionOptions().use { opts ->
+                opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
+                env.createSession(onnx.absolutePath, opts)
+            }
+            val vocab = vocabFile.readLines().map { it.trimEnd('\n', '\r') }
+            return Loaded.Ok(newSession, spec, vocab)
         } catch (e: Exception) {
-            return Ready.No("Model failed to load: ${e.message ?: e.javaClass.simpleName}")
+            return Loaded.Fail("Model failed to load: ${e.message ?: e.javaClass.simpleName}")
         }
     }
 
@@ -107,119 +149,92 @@ class LipReaderEngine(private val context: Context) {
 
     /**
      * Greedy CTC decode over the model logits.
-     * [frames] - most-recent-last gray frames, each FloatArray(h*w), normalized.
+     * [frames] - oldest-first gray frames, each FloatArray(h*w), already normalized.
+     *
+     * Fixed-length models (`t` baked into input_shape) get the clip in
+     * consecutive windows, so a long sentence isn't truncated to the last second.
      */
     suspend fun transcribe(frames: List<FloatArray>): String =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
             val s = requireNotNull(session) { "engine not ready" }
             val sp = requireNotNull(spec)
+            if (frames.isEmpty()) return@withContext ""
             synchronized(s) {
-                if (frames.isEmpty()) return@withContext ""
+                val windows: List<List<FloatArray>> = when {
+                    sp.fixedT <= 0 -> listOf(frames)
+                    // pad a short tail by holding the last frame
+                    else -> frames.chunked(sp.fixedT).map { it + List(sp.fixedT - it.size) { _ -> it.last() } }
+                }
+                windows.joinToString(" ") { infer(s, sp, it) }
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+            }
+        }
 
-                var use = frames
-                if (sp.fixedT > 0) {
-                    use = when {
-                        frames.size > sp.fixedT -> frames.takeLast(sp.fixedT)
-                        frames.size < sp.fixedT -> {
-                            val pad = MutableList<FloatArray>(sp.fixedT - frames.size) { frames.first() }
-                            pad + frames
-                        }
-                        else -> frames
+    private fun infer(s: OrtSession, sp: Spec, use: List<FloatArray>): String {
+        val t = use.size
+        val env = OrtEnvironment.getEnvironment()
+        val order = sp.order
+        val dims = IntArray(order.length) { i ->
+            when (order[i]) {
+                'n' -> 1
+                't' -> t
+                else -> sp.shape[i]
+            }
+        }
+        val shapeLongs = LongArray(dims.size) { dims[it].toLong() }
+        val buf = FloatArray(dims.fold(1) { a, b -> a * b })
+
+        fun stride(letter: Char): Int {
+            val pos = order.indexOf(letter)
+            var acc = 1
+            for (k in pos + 1 until dims.size) acc *= dims[k]
+            return acc
+        }
+        val sT = stride('t')
+        val sC = stride('c')
+        val sH = stride('h')
+        val sW = stride('w')
+
+        for (ti in 0 until t) {
+            val frame = use[ti]
+            for (hi in 0 until sp.height) {
+                val rowBase = sT * ti + sH * hi
+                for (wi in 0 until sp.width) {
+                    val v = frame[hi * sp.width + wi]
+                    val base = rowBase + sW * wi
+                    buf[base] = v
+                    if (sp.channels == 3) {
+                        buf[base + sC] = v
+                        buf[base + 2 * sC] = v
                     }
-                }
-
-                val t = use.size
-                val env = OrtEnvironment.getEnvironment()
-                val order = sp.order
-                val shapeLongs = LongArray(sp.shape.size) { i ->
-                    val letter = order[i]
-                    when (letter) {
-                        'n' -> 1L
-                        't' -> t.toLong()
-                        else -> sp.shape[i].toLong()
-                    }
-                }
-                val dimsLocal = order.map { c ->
-                    when (c) {
-                        'n' -> 1
-                        't' -> t
-                        else -> sp.shape[order.indexOf(c)]
-                    }
-                }
-
-                val total = shapeLongs.fold(1L) { a, b -> a * b }.toInt()
-                val outBuf = FloatArray(total)
-
-                val posN = order.indexOf('n')
-                val posT = order.indexOf('t')
-                val posC = order.indexOf('c')
-                val posH = order.indexOf('h')
-                val posW = order.indexOf('w')
-
-                fun stride(pos: Int): Int {
-                    if (pos < 0) return 0
-                    var acc = 1
-                    for (k in pos + 1 until dimsLocal.size) acc *= dimsLocal[k]
-                    return acc
-                }
-                val sN = stride(posN)
-                val sT = stride(posT)
-                val sC = stride(posC)
-                val sH = stride(posH)
-                val sW = stride(posW)
-
-                var ti = 0
-                val plane = sp.height * sp.width
-                while (ti < t) {
-                    val frame = use[ti]
-                    var hi = 0
-                    while (hi < sp.height) {
-                        val rowBase = sT * ti + sH * hi
-                        var wi = 0
-                        while (wi < sp.width) {
-                            val v = frame[hi * sp.width + wi]
-                            val base = rowBase + sW * wi
-                            // channel 0
-                            outBuf[base] = v
-                            if (sp.channels == 3) {
-                                outBuf[base + sC] = v
-                                outBuf[base + 2 * sC] = v
-                            }
-                            wi++
-                        }
-                        hi++
-                    }
-                    ti++
-                }
-
-                val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(outBuf), shapeLongs)
-                val outputs = try {
-                    s.run(java.util.Collections.singletonMap(sp.inputName, tensor))
-                } finally {
-                    tensor.close()
-                }
-                outputs.use { res ->
-                    val v = res[0].value
-                    @Suppress("UNCHECKED_CAST")
-                    val logitsPerStep: List<FloatArray> =
-                        if (v is FloatArray) {
-                            listOf(v)
-                        } else if (v is Array<*> && v.isArrayOf<FloatArray>()) {
-                            (v as Array<FloatArray>).toList()
-                        } else if (v is Array<*> && v.first() is Array<*> &&
-                            (v.first() as Array<*>).isArrayOf<FloatArray>()
-                        ) {
-                            (v[0] as Array<FloatArray>).toList()
-                        } else {
-                            emptyList()
-                        }
-                    decode(logitsPerStep, sp)
                 }
             }
         }
 
+        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(buf), shapeLongs)
+        val outputs = try {
+            s.run(java.util.Collections.singletonMap(sp.inputName, tensor))
+        } finally {
+            tensor.close()
+        }
+        return outputs.use { res ->
+            val v = res[0].value
+            @Suppress("UNCHECKED_CAST")
+            val steps: List<FloatArray> = when {
+                v is FloatArray -> listOf(v)
+                v is Array<*> && v.isArrayOf<FloatArray>() -> (v as Array<FloatArray>).toList()
+                v is Array<*> && v.isNotEmpty() && v[0] is Array<*> &&
+                    (v[0] as Array<*>).isArrayOf<FloatArray>() -> (v[0] as Array<FloatArray>).toList()
+                else -> emptyList()
+            }
+            decode(steps, sp)
+        }
+    }
+
+    /** Greedy CTC: argmax per step, collapse repeats, drop blanks, join tokens. */
     private fun decode(logits: List<FloatArray>, sp: Spec): String {
-        val vocab = loadVocab()
+        val vocab = this.vocab
         if (vocab.isEmpty()) return ""
         val sb = StringBuilder()
         var prev = -1
@@ -233,30 +248,24 @@ class LipReaderEngine(private val context: Context) {
                 }
             }
             if (best == sp.blankId) {
-                // a blank resets repeat-merging (same token again = two tokens)
-                prev = -1
+                prev = -1 // a blank separates genuine repeats
                 continue
             }
             if (best == prev) continue
             prev = best
             val tok = vocab.getOrNull(best) ?: continue
-            if (tok in sp.ignore || tok.isEmpty()) continue
-            sb.append(tok.first())
+            if (tok.isEmpty() || tok in sp.ignore) continue
+            sb.append(
+                when (tok) {
+                    "<space>", "|", "_" -> " "
+                    else -> tok.replace('\u2581', ' ') // sentencepiece word marker
+                }
+            )
         }
-        return sb.toString().trim()
+        return sb.toString().replace(Regex("\\s+"), " ").trim()
     }
 
-    private var vocabCache: List<String>? = null
-
-    private fun loadVocab(): List<String> {
-        vocabCache?.let { return it }
-        val f = File(context.filesDir, "model/vocab.txt")
-        val lines = if (f.exists()) {
-            f.readLines().map { it.trimEnd('\n', '\r') }
-        } else emptyList()
-        vocabCache = lines
-        return lines
-    }
+    private var vocab: List<String> = emptyList()
 
     fun close() {
         val old: OrtSession?
@@ -264,9 +273,14 @@ class LipReaderEngine(private val context: Context) {
             old = session
             session = null
         }
-        try {
-            old?.close()
-        } catch (_: Exception) {
+        if (old == null) return
+        // transcribe() holds this lock for the whole run: wait for it rather than
+        // freeing native memory under a running inference
+        synchronized(old) {
+            try {
+                old.close()
+            } catch (_: Exception) {
+            }
         }
     }
 }
