@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.RectF
 import android.os.SystemClock
+import android.text.TextPaint
 import android.text.TextUtils
 import android.util.AttributeSet
 import android.view.HapticFeedbackConstants
@@ -12,10 +13,11 @@ import android.view.MotionEvent
 import android.view.View
 import app.silentdictate.util.Palette
 import kotlin.math.abs
+import kotlin.math.hypot
 
 /**
  * The single-button dictation panel. Hold the circle to record your lips;
- * release to transcribe. Swipe right (or tap the back chip) to return.
+ * release to transcribe. Swipe right anywhere to return to the keys.
  */
 class MicPanel @JvmOverloads constructor(
     context: Context,
@@ -29,27 +31,49 @@ class MicPanel @JvmOverloads constructor(
         fun onBack()
     }
 
+    enum class State { IDLE, HOLDING, THINKING }
+
     fun setListener(l: Listener?) {
         listener = l
     }
 
-    enum class State { IDLE, HOLDING, THINKING }
-
-    fun setState(state: State, message: String?) {
+    fun setState(state: State, message: String?, isError: Boolean = false) {
         this.state = state
         this.message = message
-        holdStartedAt = if (state == State.IDLE) 0L else SystemClock.elapsedRealtime()
+        this.messageIsError = isError
+        stateSince = SystemClock.elapsedRealtime()
+        removeCallbacks(clearMessage)
+        if (state == State.IDLE && message != null) postDelayed(clearMessage, 4000L)
         invalidate()
+    }
+
+    /** False when the camera can't see a face while holding. */
+    fun setFaceVisible(visible: Boolean) {
+        if (faceVisible != visible) {
+            faceVisible = visible
+            invalidate()
+        }
     }
 
     private var listener: Listener? = null
     private var state = State.IDLE
     private var message: String? = null
+    private var messageIsError = false
+    private var faceVisible = true
+    private var stateSince = 0L
 
-    private var holdStartedAt = 0L
-    private var animating = false
+    /** 0 idle → 1 held, eased per frame. */
+    private var hold = 0f
+    private var lastFrame = 0L
 
-    private val circlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val clearMessage = Runnable {
+        if (state == State.IDLE) {
+            message = null
+            invalidate()
+        }
+    }
+
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
@@ -57,227 +81,190 @@ class MicPanel @JvmOverloads constructor(
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
-        color = Palette.textPrimary
+        strokeJoin = Paint.Join.ROUND
     }
-    private val captionPaint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Palette.textSecondary
-        textAlign = Paint.Align.CENTER
-    }
-
-    private val backPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Palette.textSecondary
-        textAlign = Paint.Align.LEFT
-    }
-
-    private val tick = object : Runnable {
-        override fun run() {
-            if (state == State.IDLE) {
-                animating = false
-                return
-            }
-            invalidate()
-            postInvalidateOnAnimation()
-            postDelayed(this, 16L)
-        }
-    }
-
-    private fun startTick() {
-        if (animating) return
-        animating = true
-        postInvalidateOnAnimation()
-        post(tick)
-    }
+    private val captionPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val rect = RectF()
 
     private fun dp(v: Float): Float = v * resources.displayMetrics.density
+
+    // ---------------------------------------------------------------- geometry
+
+    private val radius get() = dp(46f)
+    private val cx get() = width / 2f
+    private val cy: Float
+        get() {
+            val top = dp(22f)
+            val region = height - top - dp(6f)
+            val block = radius * 2 + dp(66f)
+            return top + (region - block) / 2f + radius
+        }
+
+    // ---------------------------------------------------------------- drawing
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Palette.bg)
 
-        val cx = width / 2f
-        val cy = height * 0.34f
-        val r = dp(46f)
-        val elapsed = if (holdStartedAt > 0) SystemClock.elapsedRealtime() - holdStartedAt else 0L
+        val now = SystemClock.elapsedRealtime()
+        val dt = if (lastFrame == 0L) 16L else (now - lastFrame).coerceIn(1L, 40L)
+        lastFrame = now
+        val target = if (state == State.HOLDING) 1f else 0f
+        hold += (target - hold) * (1f - Math.exp(-dt / 55.0).toFloat())
+        if (abs(target - hold) < 0.004f) hold = target
+        val elapsed = now - stateSince
 
-        when (state) {
-            State.IDLE -> drawIdle(canvas, cx, cy, r)
-            State.HOLDING -> drawHolding(canvas, cx, cy, r, elapsed)
-            State.THINKING -> drawThinking(canvas, cx, cy, r, elapsed)
+        drawPageDots(canvas)
+        drawButton(canvas, elapsed)
+        drawCaption(canvas)
+
+        if (state != State.IDLE || hold != target) postInvalidateOnAnimation() else lastFrame = 0L
+    }
+
+    private fun drawPageDots(canvas: Canvas) {
+        val y = dp(11f)
+        fillPaint.color = Palette.textFaint
+        canvas.drawCircle(cx - dp(6f), y, dp(2.4f), fillPaint)
+        fillPaint.color = Palette.textSecondary
+        canvas.drawCircle(cx + dp(6f), y, dp(2.4f), fillPaint)
+    }
+
+    private fun drawButton(canvas: Canvas, elapsed: Long) {
+        val x = cx
+        val y = cy
+        val r = radius * (1f + 0.07f * hold)
+
+        // ripples while holding
+        if (state == State.HOLDING) {
+            val period = 1600f
+            for (i in 0 until 2) {
+                val p = ((elapsed + i * (period / 2f)) % period) / period
+                ringPaint.strokeWidth = dp(1.4f)
+                ringPaint.color = Palette.withAlpha(Palette.textPrimary, (1f - p) * 0.32f * hold)
+                canvas.drawCircle(x, y, r * (1.05f + p * 0.75f), ringPaint)
+            }
         }
-        if (state == State.HOLDING || state == State.THINKING) startTick()
 
-        drawCaption(canvas, cx, cy, r)
-        drawBackChip(canvas)
-    }
+        fillPaint.color = Palette.mix(Palette.keyBg, Palette.textPrimary, hold)
+        canvas.drawCircle(x, y, r, fillPaint)
 
-    private fun drawIdle(canvas: Canvas, cx: Float, cy: Float, r: Float) {
-        circlePaint.color = Palette.keyBg
-        canvas.drawCircle(cx, cy, r, circlePaint)
-        ringPaint.strokeWidth = dp(2f)
-        ringPaint.color = Palette.textPrimary
-        canvas.drawCircle(cx, cy, r, ringPaint)
-        drawMicIcon(canvas, cx, cy, r, Palette.textPrimary)
-    }
+        ringPaint.strokeWidth = dp(1.5f)
+        ringPaint.color = Palette.mix(Palette.keyPressed, Palette.textPrimary, hold)
+        canvas.drawCircle(x, y, r - dp(0.75f), ringPaint)
 
-    private fun drawHolding(canvas: Canvas, cx: Float, cy: Float, r: Float, elapsed: Long) {
-        circlePaint.color = Palette.keyPressed
-        canvas.drawCircle(cx, cy, r, circlePaint)
-        ringPaint.strokeWidth = dp(2f)
-        ringPaint.color = Palette.textPrimary
-        canvas.drawCircle(cx, cy, r, ringPaint)
-
-        val period = 1400f
-        for (i in 0 until 2) {
-            val p = (((elapsed + i * period.toLong() / 2L) % period.toLong()).toFloat() / period)
-            ringPaint.strokeWidth = dp(1.6f)
-            ringPaint.color = tintAlpha(Palette.textPrimary, (1 - p) * 0.45f)
-            canvas.drawCircle(cx, cy, r * (1f + p * 0.9f), ringPaint)
+        if (state == State.THINKING) {
+            val sweep = 80f
+            val start = (elapsed % 1100L) / 1100f * 360f - 90f
+            ringPaint.strokeWidth = dp(2.2f)
+            ringPaint.color = Palette.textPrimary
+            rect.set(x - r + dp(0.75f), y - r + dp(0.75f), x + r - dp(0.75f), y + r - dp(0.75f))
+            canvas.drawArc(rect, start, sweep, false, ringPaint)
         }
-        drawMicIcon(canvas, cx, cy, r, Palette.textPrimary)
+
+        val iconColor = when (state) {
+            State.THINKING -> Palette.textSecondary
+            else -> Palette.mix(Palette.textPrimary, Palette.bg, hold)
+        }
+        drawMicIcon(canvas, x, y, radius, iconColor)
     }
 
-    private fun drawThinking(canvas: Canvas, cx: Float, cy: Float, r: Float, elapsed: Long) {
-        circlePaint.color = Palette.keyBg
-        canvas.drawCircle(cx, cy, r, circlePaint)
-        ringPaint.strokeWidth = dp(2f)
-        ringPaint.color = Palette.keyBgSpecial
-        canvas.drawCircle(cx, cy, r, ringPaint)
-
-        val rot = (elapsed % 1400L).toFloat() / 1400f * 360f - 90f
-        ringPaint.strokeWidth = dp(2.5f)
-        ringPaint.color = Palette.textPrimary
-        canvas.drawArc(
-            RectF(cx - r, cy - r, cx + r, cy + r),
-            rot, 70f, false, ringPaint
-        )
-        drawMicIcon(canvas, cx, cy, r, Palette.textSecondary)
-    }
-
-    private fun drawMicIcon(canvas: Canvas, cx: Float, cy: Float, r: Float, color: Int) {
+    private fun drawMicIcon(canvas: Canvas, x: Float, y: Float, r: Float, color: Int) {
         iconPaint.color = color
-        iconPaint.strokeWidth = r * 0.10f
-        val bodyTop = cy - r * 0.32f
-        val bodyBottom = cy + r * 0.16f
-        val bodyHalfW = r * 0.155f
-        canvas.drawRoundRect(
-            RectF(cx - bodyHalfW, bodyTop, cx + bodyHalfW, bodyBottom),
-            bodyHalfW, bodyHalfW, iconPaint
-        )
-        // lower arc bracket
-        val arcR = r * 0.30f
-        canvas.drawArc(
-            RectF(cx - arcR, cy - arcR, cx + arcR, cy + arcR),
-            0f, 180f, false, iconPaint
-        )
+        iconPaint.strokeWidth = r * 0.085f
+        val bodyHalfW = r * 0.16f
+        val bodyTop = y - r * 0.42f
+        val bodyBottom = y + r * 0.06f
+        rect.set(x - bodyHalfW, bodyTop, x + bodyHalfW, bodyBottom)
+        canvas.drawRoundRect(rect, bodyHalfW, bodyHalfW, iconPaint)
+        // cradle
+        val arcR = r * 0.31f
+        val arcCy = y - r * 0.04f
+        rect.set(x - arcR, arcCy - arcR, x + arcR, arcCy + arcR)
+        canvas.drawArc(rect, 20f, 140f, false, iconPaint)
         // stem
-        canvas.drawLine(cx, cy + arcR, cx, cy + r * 0.46f, iconPaint)
+        canvas.drawLine(x, arcCy + arcR, x, y + r * 0.50f, iconPaint)
+        canvas.drawLine(x - r * 0.14f, y + r * 0.50f, x + r * 0.14f, y + r * 0.50f, iconPaint)
     }
 
-    private fun drawCaption(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+    private fun drawCaption(canvas: Canvas) {
+        val y = cy + radius + dp(48f)
         captionPaint.textSize = dp(14f)
-        val color = when {
-            state == State.HOLDING -> Palette.textPrimary
-            state == State.THINKING -> Palette.textSecondary
-            isError(message) -> Palette.danger
-            else -> Palette.textSecondary
+        val text: String
+        when {
+            state == State.HOLDING -> {
+                text = if (faceVisible) "reading your lips…" else "can’t see your face"
+                captionPaint.color = if (faceVisible) Palette.textPrimary else Palette.danger
+            }
+            state == State.THINKING -> {
+                text = message ?: "piecing the words together…"
+                captionPaint.color = Palette.textSecondary
+            }
+            message != null -> {
+                text = message!!
+                captionPaint.color = if (messageIsError) Palette.danger else Palette.textSecondary
+            }
+            else -> {
+                text = "hold to dictate silently"
+                captionPaint.color = Palette.textSecondary
+            }
         }
-        captionPaint.color = color
-        val text = when {
-            state == State.HOLDING -> "reading your lips…"
-            state == State.THINKING -> "piecing the words together…"
-            message != null -> message!!
-            else -> "hold to dictate silently"
-        }
-        val y = cy + r + dp(38f)
-        val ellipsized = TextUtils.ellipsize(
-            text, captionPaint, width * 0.92f, TextUtils.TruncateAt.END
-        ).toString()
-        canvas.drawText(ellipsized, cx, y, captionPaint)
-
-        if (state == State.IDLE) {
+        canvas.drawText(
+            TextUtils.ellipsize(text, captionPaint, width * 0.9f, TextUtils.TruncateAt.END).toString(),
+            cx, y, captionPaint
+        )
+        if (state == State.IDLE && message == null) {
+            captionPaint.textSize = dp(12f)
             captionPaint.color = Palette.textFaint
-            captionPaint.textSize = dp(11f)
-            canvas.drawText("‹ swipe right to type", cx, y + dp(18f), captionPaint)
+            canvas.drawText("swipe right to type  ›", cx, y + dp(22f), captionPaint)
         }
     }
 
-    private fun isError(msg: String?): Boolean =
-        msg != null && (msg.startsWith("Couldn") || msg.startsWith("No ") ||
-            msg.startsWith("Camera") || msg.startsWith("Too short"))
+    // ---------------------------------------------------------------- touch
 
-    private fun drawBackChip(canvas: Canvas) {
-        backPaint.textSize = dp(16f)
-        backPaint.color = Palette.textSecondary
-        canvas.drawText("‹ type", dp(18f), dp(30f), backPaint)
-    }
-
-    private fun insideBack(p: Float, q: Float): Boolean =
-        p < dp(80f) && q < dp(44f)
-
-    private var touchDownX = 0f
-    private var touchDownY = 0f
+    private var downX = 0f
+    private var downY = 0f
     private var holding = false
-    private var downOnBack = false
+
+    private fun onButton(x: Float, y: Float): Boolean =
+        hypot(x - cx, y - cy) <= radius + dp(44f)
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         parent?.requestDisallowInterceptTouchEvent(true)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                touchDownX = event.x
-                touchDownY = event.y
-                downOnBack = insideBack(event.x, event.y)
-                if (!downOnBack) {
+                downX = event.x
+                downY = event.y
+                if (onButton(event.x, event.y)) {
                     holding = true
-                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                     listener?.onHoldStart()
                 }
-                return true
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = event.x - touchDownX
-                if (downOnBack && dx < -dp(28f)) {
-                    downOnBack = false
-                }
-                if (dx > dp(64f) && abs(dx) > abs(event.y - touchDownY) * 2f) {
+                val dx = event.x - downX
+                if (dx > dp(72f) && dx > abs(event.y - downY) * 1.6f) {
                     if (holding) {
                         holding = false
                         listener?.onHoldCancel()
                     }
+                    downX = Float.MAX_VALUE // fire once
                     listener?.onBack()
                 }
-                return true
             }
             MotionEvent.ACTION_CANCEL -> {
                 if (holding) {
                     holding = false
                     listener?.onHoldCancel()
                 }
-                return true
             }
             MotionEvent.ACTION_UP -> {
-                if (downOnBack && insideBack(event.x, event.y) &&
-                    abs(event.y - touchDownY) < dp(24f) && abs(event.x - touchDownX) < dp(24f)
-                ) {
-                    listener?.onBack()
-                    return true
-                }
                 if (holding) {
                     holding = false
                     performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                     listener?.onHoldEnd()
                 }
-                return true
             }
             else -> return super.onTouchEvent(event)
         }
-    }
-
-    private fun tintAlpha(color: Int, alpha: Float): Int {
-        val a = (alpha.coerceIn(0f, 1f) * 255).toInt()
-        return android.graphics.Color.argb(
-            a,
-            android.graphics.Color.red(color),
-            android.graphics.Color.green(color),
-            android.graphics.Color.blue(color),
-        )
+        return true
     }
 }
