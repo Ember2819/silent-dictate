@@ -32,8 +32,13 @@ class Prefs(context: Context) {
         set(value) = sp.edit().putBoolean(KEY_SWIPE_HINT, value).apply()
 
     companion object {
-        /** OpenRouter's free-model router: always points at a currently available free model. */
-        const val DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+        /**
+         * A specific small/fast model, not the `openrouter/free` router: the
+         * router lands on huge reasoning models that are slow and rate-limited,
+         * and cleanup is a task a small instruct model does well. If it is
+         * retired, [app.silentdictate.ai.OpenRouterClient] falls back once.
+         */
+        const val DEFAULT_OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
         private const val LEGACY_DEFAULT_MODEL = "meta-llama/llama-3.2-3b-instruct:free"
         private const val KEY_USE_OPENROUTER = "use_openrouter"
         private const val KEY_OPENROUTER_KEY = "openrouter_key"

@@ -245,7 +245,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:text="Get a free key at openrouter.ai/keys. The default model, openrouter/free, always picks a currently available free model."
+                    android:text="Get a free key at openrouter.ai/keys. The default model is small and fast — swap it in the box above if you prefer another. "
                     android:textColor="@color/text_faint"
                     android:textSize="12sp" />
             </LinearLayout>

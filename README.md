@@ -87,7 +87,7 @@ emulator and a 210 MB download, so they run locally: `./tools/real_video_test.sh
 4. Allow the camera (only used while the dictation page is open).
 5. Add the lip model — **Download** (203 MB, best on Wi-Fi).
 6. Transcription → **OpenRouter** (recommended), paste your API key. The model
-   defaults to `openrouter/free`. "Check key" sends a tiny test request.
+   defaults to a small, fast free model. "Check key" sends a tiny test request.
    Pick **Raw output** to insert the lip reader's text as-is (it's inaccurate
    and unreliable on its own).
 
