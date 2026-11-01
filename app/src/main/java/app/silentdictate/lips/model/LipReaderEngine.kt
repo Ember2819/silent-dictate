@@ -132,9 +132,20 @@ class LipReaderEngine(private val context: Context) {
             )
 
             val env = OrtEnvironment.getEnvironment()
-            val newSession = OrtSession.SessionOptions().use { opts ->
-                opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
-                env.createSession(onnx.absolutePath, opts)
+            // XNNPACK EP runs the quantized conv/attention kernels noticeably
+            // faster than the plain CPU EP on ARM phones; if a build/device
+            // rejects it, fall back to the plain CPU session unchanged.
+            val newSession = try {
+                OrtSession.SessionOptions().use { opts ->
+                    opts.setIntraOpNumThreads(1)   // XNNPACK brings its own pool
+                    opts.addXnnpack(mapOf("intra_op_num_threads" to "4"))
+                    env.createSession(onnx.absolutePath, opts)
+                }
+            } catch (_: Throwable) {
+                OrtSession.SessionOptions().use { opts ->
+                    opts.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
+                    env.createSession(onnx.absolutePath, opts)
+                }
             }
             val vocab = vocabFile.readLines().map { it.trimEnd('\n', '\r') }
             return Loaded.Ok(newSession, spec, vocab)

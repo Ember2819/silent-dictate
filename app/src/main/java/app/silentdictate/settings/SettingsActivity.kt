@@ -237,7 +237,7 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun verifyKey() {
-        val key = apiKey.text.toString().trim()
+        val key = OpenRouterClient.normalizeKey(apiKey.text.toString())
         val model = modelName.text.toString().trim()
         if (key.isBlank()) {
             showCheck("Paste a key first", error = true)
@@ -250,6 +250,7 @@ class SettingsActivity : AppCompatActivity() {
                 key = key, model = model,
                 rawLipRead = "i stl to, same conve",
                 contextBefore = "",
+                allowFallbacks = false,   // a check tests the user's own model, not the fallbacks
             )
             checkKey.isEnabled = true
             when (result) {
