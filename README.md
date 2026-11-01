@@ -58,7 +58,6 @@ v2-only builds; this re-signs everything with v1+v2 signatures.
 ## Releases
 
 Signed APKs are built by GitHub Actions (`.github/workflows/release.yml`):
-
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
 ```
@@ -74,6 +73,11 @@ base64-encoded), `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS`,
 `RELEASE_KEYSTORE_PATH` instead of the base64 one) to build a signed release.
 **Keep the keystore safe:** Android only installs updates signed with the same
 key, so losing it means users must uninstall to upgrade.
+
+**In-app updates:** the settings screen has an Updates card that checks this
+repo's releases (via the `releases/latest` redirect, no API key), downloads the
+APK matched to the phone's ABI, and hands it to the system package installer.
+
 
 CI (`.github/workflows/ci.yml`) builds debug APKs, runs lint and compiles the
 instrumented tests on every push and pull request. The real-video tests need an

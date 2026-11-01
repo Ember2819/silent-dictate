@@ -12,8 +12,8 @@ android {
         minSdk = 26
         targetSdk = 34
         // CI passes these from the git tag (v1.2.3) and run number; local builds use the defaults
-        versionCode = (System.getenv("VERSION_CODE") ?: "4").toInt()
-        versionName = System.getenv("VERSION_NAME") ?: "0.2.1"
+        versionCode = (System.getenv("VERSION_CODE") ?: "5").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.2.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

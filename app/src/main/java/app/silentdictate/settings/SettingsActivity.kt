@@ -33,6 +33,7 @@ import app.silentdictate.R
 import app.silentdictate.ai.OpenRouterClient
 import app.silentdictate.lips.model.ModelInstaller
 import app.silentdictate.lips.model.ModelManager
+import app.silentdictate.update.Updater
 import app.silentdictate.util.Palette
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -72,6 +73,17 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var modelImport: TextView
     private lateinit var modelDownload: Button
     private lateinit var modelRemove: Button
+
+    private lateinit var updateStatus: TextView
+    private lateinit var updateDetail: TextView
+    private lateinit var updateProgress: android.widget.ProgressBar
+    private lateinit var updateAction: Button
+    private lateinit var updateSkip: Button
+
+    private var updater = Updater(this)
+    private var updateOffer: Updater.Check.Available? = null
+    private var downloadedUpdate: java.io.File? = null
+    private var updateBusy = false
 
     private var busy = false
 
@@ -145,6 +157,21 @@ class SettingsActivity : AppCompatActivity() {
             rebuildSteps()
         }
 
+        updateStatus = findViewById(R.id.update_status)
+        updateDetail = findViewById(R.id.update_detail)
+        updateProgress = findViewById(R.id.update_progress)
+        updateAction = findViewById(R.id.update_action)
+        updateSkip = findViewById(R.id.update_skip)
+        updateProgress.progressTintList = android.content.res.ColorStateList.valueOf(Palette.textPrimary)
+        updateProgress.progressBackgroundTintList = android.content.res.ColorStateList.valueOf(0xFF2A2D32.toInt())
+        updateAction.setOnClickListener { onUpdateAction() }
+        updateSkip.setOnClickListener {
+            updateOffer = null
+            downloadedUpdate = null
+            renderUpdateIdle()
+        }
+        renderUpdateIdle()
+
         applyMode(animate = false)
     }
 
@@ -164,6 +191,7 @@ class SettingsActivity : AppCompatActivity() {
         super.onResume()
         rebuildSteps()
         if (!ModelInstaller.busy) refreshModel()
+        autoCheckUpdate()
     }
 
     override fun onDestroy() {
@@ -308,6 +336,160 @@ class SettingsActivity : AppCompatActivity() {
     private fun importModel(uri: Uri) = ModelInstaller.importZip(this, uri)
 
     private fun downloadModel() = ModelInstaller.downloadRecommended(this)
+
+    // ------------------------------------------------------------ in-app updates
+
+    /** One quiet GitHub check per process (refreshed by the manual button). */
+    private var autoChecked = false
+    private fun autoCheckUpdate() {
+        if (autoChecked || updateBusy) return
+        autoChecked = true
+        scope.launch { checkUpdate(manual = false) }
+    }
+
+    private fun onUpdateAction() {
+        when {
+            updateBusy -> Unit
+            downloadedUpdate != null -> installUpdate()
+            updateOffer != null -> startDownload()
+            else -> scope.launch { checkUpdate(manual = true) }
+        }
+    }
+
+    private suspend fun checkUpdate(manual: Boolean) {
+        if (updateBusy) return
+        if (manual) {
+            updateStatus.text = "Checking…"
+            updateStatus.setTextColor(Palette.textPrimary)
+            updateDetail.text = "Asking GitHub for the latest release…"
+            updateDetail.setTextColor(Palette.textSecondary)
+        }
+        when (val result = updater.check()) {
+            is Updater.Check.Available -> {
+                if (!manual && sameOffer(result)) return
+                updateOffer = result
+                downloadedUpdate = null
+                updateStatus.text = "Version ${result.version} available"
+                updateStatus.setTextColor(Palette.textPrimary)
+                updateDetail.text =
+                    "Current version is ${updater.installedVersion()}. " +
+                        "Installs over the existing one; your settings and model stay."
+                updateDetail.setTextColor(Palette.textSecondary)
+                updateProgress.visibility = View.GONE
+                updateAction.text = "Download update"
+                updateSkip.visibility = View.VISIBLE
+            }
+            is Updater.Check.UpToDate -> {
+                if (!manual) return
+                updateOffer = null
+                downloadedUpdate = null
+                updateStatus.text = "Up to date"
+                updateStatus.setTextColor(Palette.textPrimary)
+                updateDetail.text = "v${result.version} is the latest release."
+                updateDetail.setTextColor(Palette.textSecondary)
+                updateProgress.visibility = View.GONE
+                updateAction.text = "Check again"
+                updateSkip.visibility = View.GONE
+            }
+            is Updater.Check.Failed -> {
+                if (!manual) return
+                updateOffer = null
+                downloadedUpdate = null
+                updateStatus.text = "Couldn’t check for updates"
+                updateStatus.setTextColor(Palette.danger)
+                updateDetail.text = result.message
+                updateDetail.setTextColor(Palette.danger)
+                updateProgress.visibility = View.GONE
+                updateAction.text = "Try again"
+                updateSkip.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun sameOffer(offer: Updater.Check.Available): Boolean =
+        updateOffer?.version == offer.version && downloadedUpdate == null
+
+    private fun startDownload() {
+        val offer = updateOffer ?: return
+        updateBusy = true
+        updateAction.isEnabled = false
+        updateSkip.isEnabled = false
+        updateStatus.text = "Downloading update…"
+        updateStatus.setTextColor(Palette.textPrimary)
+        updateDetail.text = "From GitHub"
+        updateDetail.setTextColor(Palette.textSecondary)
+        updateProgress.isIndeterminate = true
+        updateProgress.visibility = View.VISIBLE
+        scope.launch {
+            try {
+                val file = updater.download(offer.assetUrl) { read, total ->
+                    scope.launch(Dispatchers.Main) {
+                        updateProgress.isIndeterminate = total <= 0
+                        if (total > 0) updateProgress.progress = (read * 1000 / total).toInt()
+                        val mb = { b: Long -> "%.1f MB".format(b / (1024f * 1024f)) }
+                        updateDetail.text = if (total > 0)
+                            "${mb(read)} / ${mb(total)}"
+                        else "${mb(read)} downloaded…"
+                    }
+                }
+                downloadedUpdate = file
+                updateOffer = null
+                updateStatus.text = "Update downloaded"
+                updateDetail.text = "Ready to install — v${offer.version}"
+                updateDetail.setTextColor(Palette.textSecondary)
+                updateProgress.visibility = View.GONE
+                updateAction.text = "Install now"
+                updateSkip.visibility = View.VISIBLE
+            } catch (e: Exception) {
+                updateStatus.text = "Download failed"
+                updateStatus.setTextColor(Palette.danger)
+                updateDetail.text = e.message ?: "Network error"
+                updateDetail.setTextColor(Palette.danger)
+                updateProgress.visibility = View.GONE
+                updateAction.text = "Try again"
+            } finally {
+                updateBusy = false
+                updateAction.isEnabled = true
+                updateSkip.isEnabled = true
+            }
+        }
+    }
+
+    private fun installUpdate() {
+        val file = downloadedUpdate ?: return
+        if (!updater.canRequestInstalls()) {
+            updater.requestInstallApproval()
+            return
+        }
+        updateBusy = true
+        updateAction.isEnabled = false
+        updateSkip.isEnabled = false
+        updateStatus.text = "Starting install…"
+        updateDetail.text = "Android’s installer takes it from here."
+        updateDetail.setTextColor(Palette.textSecondary)
+        if (!updater.install(file)) {
+            updateStatus.text = "Couldn’t open the installer"
+            updateStatus.setTextColor(Palette.danger)
+            updateDetail.text = "Install manually: github.com/Ember2819/silent-dictate/releases"
+            updateDetail.setTextColor(Palette.danger)
+        }
+        updateBusy = false
+        updateAction.isEnabled = true
+        updateSkip.isEnabled = true
+    }
+
+    private fun renderUpdateIdle() {
+        val current = updater.installedVersion()
+        updateStatus.text = "Version $current"
+        updateStatus.setTextColor(Palette.textPrimary)
+        updateDetail.text = "Tap to see if a newer release is on GitHub."
+        updateDetail.setTextColor(Palette.textSecondary)
+        updateProgress.visibility = View.GONE
+        updateAction.isEnabled = true
+        updateSkip.isEnabled = true
+        updateAction.text = "Check for updates"
+        updateSkip.visibility = View.GONE
+    }
 
     // ------------------------------------------------------------ onboarding
 
