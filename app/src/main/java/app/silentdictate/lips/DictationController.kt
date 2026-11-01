@@ -307,6 +307,12 @@ class DictationController(
                             model = prefs.openRouterModel,
                             rawLipRead = raw,
                             contextBefore = textContextProvider(),
+                            // live progress during rate-limit waits / fallbacks
+                            onStatus = { msg ->
+                                main.post {
+                                    listener.onDictationState(State.THINKING, msg, false)
+                                }
+                            },
                         )) {
                             is OpenRouterClient.Result.Ok -> finalText = outcome.text
                             is OpenRouterClient.Result.Error ->

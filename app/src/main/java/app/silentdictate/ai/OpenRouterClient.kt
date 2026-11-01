@@ -16,9 +16,13 @@ import java.util.concurrent.TimeUnit
  * into a plausible sentence. Only a short text excerpt ever leaves the device.
  *
  * Reliability rules:
- *  - transient failures (timeouts, 5xx, 429) are retried with backoff;
- *  - dead models (404 / no-endpoints 402) fall back to the default model once;
- *  - every try is budgeted so THINKING never hangs for a minute.
+ *  - 429 rate limits are honored: we wait what the server asks for
+ *    (Retry-After, capped) instead of hammering it with 1s-apart retries;
+ *  - when a model stays rate-limited or dead we move down a short chain of
+ *    alternate free models — their capacity and limits are separate, so the
+ *    second dictation in a minute still gets cleanup;
+ *  - every try is budgeted so THINKING never hangs for minutes;
+ *  - [onStatus] keeps the UI honest about what is happening during waits.
  */
 class OpenRouterClient {
 
@@ -34,46 +38,71 @@ class OpenRouterClient {
         data class Error(val userMessage: String) : Result()
     }
 
+    /**
+     * @param onStatus optional progress text shown while thinking
+     * ("waiting for the rate limit…", "trying another model…").
+     */
     suspend fun cleanUp(
         key: String,
         model: String,
         rawLipRead: String,
         contextBefore: String,
+        onStatus: (String) -> Unit = {},
     ): Result = withContext(Dispatchers.IO) {
         if (key.isBlank()) return@withContext Result.Error(
             "No OpenRouter API key set"
         )
 
         val requested = model.ifBlank { Prefs.DEFAULT_OPENROUTER_MODEL }
+        val candidates = buildList {
+            add(requested)
+            for (m in FALLBACK_FREE_MODELS) if (m != requested) add(m)
+        }
+        val deadline = System.currentTimeMillis() + TOTAL_BUDGET_MS
         var lastError: String? = null
-        for (attempt in 1..MAX_ATTEMPTS) {
-            if (attempt > 1) {
-                try {
-                    Thread.sleep(RETRY_BACKOFF_MS.toLong() * (attempt - 1))
-                } catch (_: InterruptedException) {
-                }
-            }
-            val outcome = once(key, requested, rawLipRead, contextBefore)
-            when (outcome) {
-                is Attempt.Ok -> return@withContext Result.Ok(outcome.text)
-                is Attempt.Transient -> lastError = outcome.message   // retry
-                is Attempt.ModelDead -> {
-                    // the requested model is gone: one try with the stock default
-                    if (requested != Prefs.DEFAULT_OPENROUTER_MODEL) {
-                        val fallback = once(
-                            key, Prefs.DEFAULT_OPENROUTER_MODEL, rawLipRead, contextBefore
-                        )
-                        if (fallback is Attempt.Ok) return@withContext Result.Ok(fallback.text)
-                        lastError = "“$requested” is unavailable (tried the default too)"
-                    } else {
-                        lastError = outcome.message
+        var rateLimited = false
+        var retryAfterS = 0
+
+        outer@ for ((idx, candidate) in candidates.withIndex()) {
+            if (idx > 0) onStatus("trying another model…")
+            rateLimited = false
+            retryAfterS = 0
+            for (attempt in 1..ATTEMPTS_PER_MODEL) {
+                if (attempt > 1) {
+                    val wait = backoffMs(attempt, rateLimited, retryAfterS)
+                    if (wait > 0) {
+                        if (wait >= 3000) onStatus("waiting for the rate limit…")
+                        try {
+                            Thread.sleep(wait)
+                        } catch (_: InterruptedException) {
+                        }
                     }
-                    break   // the model won't come back mid-hold
                 }
-                is Attempt.Fatal -> return@withContext Result.Error(outcome.message)
+                val outcome = once(key, candidate, rawLipRead, contextBefore)
+                when (outcome) {
+                    is Attempt.Ok -> return@withContext Result.Ok(outcome.text)
+                    is Attempt.Fatal -> return@withContext Result.Error(outcome.message)
+                    is Attempt.ModelDead -> {
+                        lastError = outcome.message
+                        continue@outer   // this model is gone — next candidate
+                    }
+                    is Attempt.Transient -> {
+                        lastError = outcome.message
+                        rateLimited = outcome.rateLimited
+                        retryAfterS = outcome.retryAfterS
+                        if (System.currentTimeMillis() > deadline) break@outer
+                    }
+                }
             }
         }
         Result.Error(lastError ?: "OpenRouter is unreachable")
+    }
+
+    /** How long to pause before the next try on the same model. */
+    private fun backoffMs(attempt: Int, rateLimited: Boolean, retryAfterS: Int): Long = when {
+        rateLimited && retryAfterS in 1..MAX_WAIT_S -> retryAfterS * 1000L
+        rateLimited -> RATE_LIMIT_BACKOFF_MS * attempt
+        else -> BACKOFF_MS * attempt
     }
 
     /** One request attempt. */
@@ -127,11 +156,13 @@ class OpenRouterClient {
                         404 -> Attempt.ModelDead("OpenRouter couldn’t find “$model”")
                         429 -> {
                             val wait = resp.header("Retry-After")?.toIntOrNull() ?: 0
-                            if (wait <= MAX_RETRY_AFTER_S) Attempt.Transient(
-                                "OpenRouter is rate-limiting — retrying…"
-                            ) else Attempt.Transient("OpenRouter is rate-limiting")
+                            Attempt.Transient(
+                                "OpenRouter is rate-limiting this model",
+                                rateLimited = true,
+                                retryAfterS = wait,
+                            )
                         }
-                        in 500..599 -> Attempt.Transient("OpenRouter error ${resp.code} — retrying…")
+                        in 500..599 -> Attempt.Transient("OpenRouter error ${resp.code}")
                         else -> Attempt.Fatal(friendlyError(resp.code, text))
                     }
                 }
@@ -154,9 +185,13 @@ class OpenRouterClient {
 
     private sealed class Attempt {
         class Ok(val text: String) : Attempt()
-        class Transient(val message: String) : Attempt()   // worth another try
-        class Fatal(val message: String) : Attempt()       // user/app must act
-        class ModelDead(val message: String) : Attempt()   // switch model once
+        class Transient(
+            val message: String,
+            val rateLimited: Boolean = false,
+            val retryAfterS: Int = 0,
+        ) : Attempt()                                          // worth another try
+        class Fatal(val message: String) : Attempt()           // user/app must act
+        class ModelDead(val message: String) : Attempt()       // switch model
     }
 
     private fun isNoEndpoints(body: String): Boolean =
@@ -191,9 +226,11 @@ class OpenRouterClient {
 
     companion object {
         private const val ENTRY_POINT = "https://openrouter.ai/api/v1/chat/completions"
-        private const val MAX_ATTEMPTS = 3
-        private const val RETRY_BACKOFF_MS = 700
-        private const val MAX_RETRY_AFTER_S = 5
+        private const val ATTEMPTS_PER_MODEL = 2
+        private const val BACKOFF_MS = 900L          // plain errors: short pause
+        private const val RATE_LIMIT_BACKOFF_MS = 5000L
+        private const val MAX_WAIT_S = 15            // honor Retry-After up to this
+        private const val TOTAL_BUDGET_MS = 75_000L  // never spin forever
         private const val MAX_TOKENS = 512
 
         /**
@@ -201,6 +238,19 @@ class OpenRouterClient {
          * A sentence takes 50–150 tokens, so the model never thinks it needs more.
          */
         private const val MAX_RAW_CHARS = 2000
+
+        /**
+         * Free alternates tried in order when the requested model is
+         * rate-limited or gone. Each has its own capacity and limits, so a
+         * second dictation right after the first usually lands on one of
+         * these. Reviewed occasionally against openrouter.ai's free list —
+         * dead ones are skipped by the ModelDead path.
+         */
+        private val FALLBACK_FREE_MODELS = listOf(
+            "google/gemma-4-31b-it:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "thinkingmachines/inkling-small:free",
+        )
 
         /**
          * Written to be copied out by small instruction models: one crystal-clear
